@@ -17,49 +17,101 @@
 module D = Debug.Make(struct let name = "jsonrpc_client" end)
 open D
 
-let input_json_object fin =
-	let buf = Buffer.create 1024 in
-	let brace_cnt = ref 0 in
-	let in_string = ref false in
-	let last_char () = Buffer.nth buf (Buffer.length buf - 1) in
-	let rec get () =
-		let c = input_char fin in
+exception Timeout
+
+let json_rpc_max_len = ref 65536 (* Arbitrary maximum length of RPC response *)
+let json_rpc_read_timeout = ref "60000000000"
+let json_rpc_write_timeout = ref "60000000000"
+
+let to_s  s = (Int64.to_float s) *. 1e-9
+
+(* Read the entire contents of the fd, of unknown length *)
+let timeout_read fd timeout =
+	let buf = Buffer.create !json_rpc_max_len in
+	let rec inner max_time max_bytes =
+		let c = Mtime_clock.counter () in
+		let get_used_time counter = Mtime.Span.to_uint64_ns (Mtime_clock.count counter) in
+		let (ready_to_read, _, _) = Unix.select [fd] [] [] (to_s max_time) in
+		if List.mem fd ready_to_read
+		then
 		begin
-			match c with
-			| '{' when not !in_string -> brace_cnt := !brace_cnt + 1
-			| '}' when not !in_string -> brace_cnt := !brace_cnt - 1
-			| '"' when !in_string && (last_char () <> '\\') -> in_string := false
-			| '"' when not !in_string -> in_string := true
-			| _ -> ()
-		end;
-		Buffer.add_char buf c;
-		if !brace_cnt > 0 then
-			get ()
+			let bytes = Bytes.make 4096 '\000' in
+			match Unix.read fd bytes 0 4096 with
+				| 0 -> Buffer.contents buf (* EOF *)
+				| n ->
+					if n > max_bytes
+					then
+					begin
+						debug "exceeding maximum read limit %d, clear buffer" !json_rpc_max_len;
+						Buffer.clear buf; (* otherwise might be parse error *)
+						Buffer.contents buf
+					end
+					else
+					begin
+						let used_time = get_used_time c in
+						let remain_time = Int64.sub max_time used_time in
+						(* here we want to make an exception in case the time is due but there are still some bytes to read, 
+						 * in such case we would like to expire a little to complete the read if possible. *)
+						let remain_time' = if remain_time < 0L then 0L else remain_time in
+						Buffer.add_subbytes buf bytes 0 n;
+						inner remain_time' (max_bytes - n)
+					end
+				| exception Unix.Unix_error(err,_,_) when err = Unix.EAGAIN || err = Unix.EWOULDBLOCK ->
+					let used_time = get_used_time c in
+					let remain_time = Int64.sub max_time used_time in
+					if remain_time < 0L then raise Timeout
+					else inner remain_time max_bytes
+		end
+		else
+		begin
+			let used_time = get_used_time c in
+			let remain_time = Int64.sub max_time used_time in
+			if remain_time < 0L then raise Timeout
+			else inner remain_time max_bytes
+		end
 	in
-	get ();
-	Buffer.contents buf
+	inner timeout !json_rpc_max_len
 
-let receive fin =
-	let obj = input_json_object fin in
-	debug "Response: %s" obj;
-	Jsonrpc.response_of_string obj
-
-let with_connection sockaddr f =
-	let fin, fout = Unix.open_connection sockaddr in
-	debug "Connected.";
-	let result = f fin fout in
-	Unix.shutdown_connection fin;
-	close_in fin;
-	debug "Shut down.";
-	result
+(* Write as many bytes to a file descriptor as possible from data before a given clock time. *)
+(* Raises Timeout exception if the number of bytes written is less than the specified length. *)
+(* Writes into the file descriptor at the current cursor position. *)
+let timeout_write filedesc length data response_time =
+	let rec inner_write filedesc data offset length remain_time =
+		let c = Mtime_clock.counter () in
+		let get_used_time counter = Mtime.Span.to_uint64_ns (Mtime_clock.count counter) in
+		let (_, ready_to_write, _) = Unix.select [] [filedesc] [] (to_s remain_time) in 
+		if List.mem filedesc ready_to_write then 
+		begin
+			let bytes_written = 
+				(try Unix.single_write filedesc data offset length with 
+				| Unix.Unix_error(Unix.EAGAIN,_,_)
+				| Unix.Unix_error(Unix.EWOULDBLOCK,_,_) -> 0)
+			in
+			let new_offset = offset + bytes_written in
+			let new_length = length - bytes_written in
+			let used_time = get_used_time c in
+			let new_remain_time = Int64.sub remain_time used_time in
+			if new_length = 0 then ()
+			else
+			if new_remain_time < 0L then raise Timeout
+			else inner_write filedesc data new_offset new_length new_remain_time
+		end
+		else
+		begin
+			let used_time = get_used_time c in
+			let new_remain_time = Int64.sub remain_time used_time in
+			if new_remain_time < 0L then raise Timeout
+			else inner_write filedesc data offset length new_remain_time
+		end
+	in
+	inner_write filedesc data 0 length response_time
 
 let with_rpc ?(version=Jsonrpc.V2) ~path ~call () =
-	let sockaddr = Unix.ADDR_UNIX path in
-	with_connection sockaddr (fun fin fout ->
-		let req = Jsonrpc.string_of_call ~version call in
-		debug "Request: %s" req;
-		output_string fout req;
-		flush fout;
-		receive fin
-	)
-
+	let uri = Uri.of_string (Printf.sprintf "file://%s" path) in
+	Open_uri.with_open_uri uri (fun s ->
+		Unix.set_nonblock s;
+		let req = Bytes.of_string (Jsonrpc.string_of_call ~version call) in
+		timeout_write s (Bytes.length req) req (Int64.of_string !json_rpc_write_timeout);
+		let res = timeout_read s (Int64.of_string !json_rpc_read_timeout) in
+		debug "Response: %s" res;
+		Jsonrpc.response_of_string res)
