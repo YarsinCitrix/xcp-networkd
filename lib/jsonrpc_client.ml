@@ -18,6 +18,7 @@ module D = Debug.Make(struct let name = "jsonrpc_client" end)
 open D
 
 exception Timeout
+exception Read_error
 
 let json_rpc_max_len = ref 65536 (* Arbitrary maximum length of RPC response *)
 let json_rpc_read_timeout = ref "60000000000"
@@ -28,10 +29,20 @@ let to_s  s = (Int64.to_float s) *. 1e-9
 (* Read the entire contents of the fd, of unknown length *)
 let timeout_read fd timeout =
 	let buf = Buffer.create !json_rpc_max_len in
+	let read_start = Mtime_clock.counter () in
+	let get_total_used_time () = Mtime.Span.to_uint64_ns (Mtime_clock.count read_start) in
 	let rec inner max_time max_bytes =
-		let c = Mtime_clock.counter () in
-		let get_used_time counter = Mtime.Span.to_uint64_ns (Mtime_clock.count counter) in
 		let (ready_to_read, _, _) = Unix.select [fd] [] [] (to_s max_time) in
+		(* This is not accurate the calculate time just for the select part. However, we
+		 * think the read time will be minor comparing to the scale of tens of seconds.
+		 * the current style will be much concise in code. *)
+		let used_time = get_total_used_time () in
+		let remain_time = Int64.sub timeout used_time in
+		if remain_time < 0L then 
+		begin
+			debug "Timeout after read %d" (Buffer.length buf);
+			raise Timeout
+		end;
 		if List.mem fd ready_to_read
 		then
 		begin
@@ -43,43 +54,36 @@ let timeout_read fd timeout =
 					then
 					begin
 						debug "exceeding maximum read limit %d, clear buffer" !json_rpc_max_len;
-						Buffer.clear buf; (* otherwise might be parse error *)
-						Buffer.contents buf
+						Buffer.clear buf;
+						raise Read_error
 					end
 					else
 					begin
-						let used_time = get_used_time c in
-						let remain_time = Int64.sub max_time used_time in
-						(* here we want to make an exception in case the time is due but there are still some bytes to read, 
-						 * in such case we would like to expire a little to complete the read if possible. *)
-						let remain_time' = if remain_time < 0L then 0L else remain_time in
 						Buffer.add_subbytes buf bytes 0 n;
-						inner remain_time' (max_bytes - n)
+						inner remain_time (max_bytes - n)
 					end
 				| exception Unix.Unix_error(err,_,_) when err = Unix.EAGAIN || err = Unix.EWOULDBLOCK ->
-					let used_time = get_used_time c in
-					let remain_time = Int64.sub max_time used_time in
-					if remain_time < 0L then raise Timeout
-					else inner remain_time max_bytes
+					inner remain_time max_bytes
 		end
-		else
-		begin
-			let used_time = get_used_time c in
-			let remain_time = Int64.sub max_time used_time in
-			if remain_time < 0L then raise Timeout
-			else inner remain_time max_bytes
-		end
+		else inner remain_time max_bytes
 	in
 	inner timeout !json_rpc_max_len
 
 (* Write as many bytes to a file descriptor as possible from data before a given clock time. *)
 (* Raises Timeout exception if the number of bytes written is less than the specified length. *)
 (* Writes into the file descriptor at the current cursor position. *)
-let timeout_write filedesc length data response_time =
-	let rec inner_write filedesc data offset length remain_time =
-		let c = Mtime_clock.counter () in
-		let get_used_time counter = Mtime.Span.to_uint64_ns (Mtime_clock.count counter) in
+let timeout_write filedesc total_length data response_time =
+	let write_start = Mtime_clock.counter () in
+	let get_total_used_time () = Mtime.Span.to_uint64_ns (Mtime_clock.count write_start) in
+	let rec inner_write filedesc offset length remain_time =
 		let (_, ready_to_write, _) = Unix.select [] [filedesc] [] (to_s remain_time) in 
+		let used_time = get_total_used_time () in
+		let new_remain_time = Int64.sub response_time used_time in
+		if new_remain_time < 0L then
+		begin
+			debug "Timeout to write %d at offset %d" total_length offset;
+			raise Timeout
+		end;
 		if List.mem filedesc ready_to_write then 
 		begin
 			let bytes_written = 
@@ -89,22 +93,12 @@ let timeout_write filedesc length data response_time =
 			in
 			let new_offset = offset + bytes_written in
 			let new_length = length - bytes_written in
-			let used_time = get_used_time c in
-			let new_remain_time = Int64.sub remain_time used_time in
 			if new_length = 0 then ()
-			else
-			if new_remain_time < 0L then raise Timeout
-			else inner_write filedesc data new_offset new_length new_remain_time
+			else inner_write filedesc new_offset new_length new_remain_time
 		end
-		else
-		begin
-			let used_time = get_used_time c in
-			let new_remain_time = Int64.sub remain_time used_time in
-			if new_remain_time < 0L then raise Timeout
-			else inner_write filedesc data offset length new_remain_time
-		end
+		else inner_write filedesc offset length new_remain_time
 	in
-	inner_write filedesc data 0 length response_time
+	inner_write filedesc 0 total_length response_time
 
 let with_rpc ?(version=Jsonrpc.V2) ~path ~call () =
 	let uri = Uri.of_string (Printf.sprintf "file://%s" path) in
